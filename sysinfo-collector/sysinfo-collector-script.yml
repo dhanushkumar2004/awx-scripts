@@ -1,0 +1,152 @@
+---
+# ==========================================================
+# MODULE 1 - Collect system info from all hosts
+# ==========================================================
+- name: Collect detailed system info from all hosts
+  hosts: all
+  gather_facts: yes
+  become: yes
+  become_user: root
+  become_method: sudo
+
+  tasks:
+    - name: Ensure required packages are installed
+      block:
+        - name: Check if required binaries exist
+          stat:
+            path: "{{ item }}"
+          register: pkg_binaries
+          loop:
+            - /usr/sbin/dmidecode
+            - /usr/bin/lsblk
+            - /usr/bin/lsb_release
+          changed_when: false
+
+        - name: Install missing tools quietly
+          apt:
+            name:
+              - dmidecode
+              - util-linux
+              - lsb-release
+            state: present
+            update_cache: yes
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          when: >
+            not (pkg_binaries.results
+                 | selectattr('stat.exists', 'equalto', true)
+                 | list | length == 3)
+      rescue:
+        - debug:
+            msg: "⚠️ Package install failed; continuing."
+
+    - name: Get CPU model
+      shell: "lscpu | awk -F: '/Model name/ {print $2}' | sed 's/^ *//'"
+      register: cpu_model
+      changed_when: false
+
+    - name: Get RAM slot usage and memory type
+      shell: |
+        total_slots=$(dmidecode -t memory | grep -E '^[[:space:]]*Memory Device' | wc -l)
+        used_slots=$(dmidecode -t memory | grep -A5 'Memory Device' | grep -E 'Size: [1-9]' | wc -l)
+        mem_type=$(dmidecode -t memory | awk -F: '/^[[:space:]]*Type:/{gsub(/^[ \t]+/,"",$2); if($2!="Unknown" && $2!="") {print $2; exit}}')
+        [ -z "$mem_type" ] && mem_type="Unknown"
+        echo "$used_slots/$total_slots,$mem_type"
+      register: ram_info
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: Get storage devices and classify
+      shell: |
+        total=0
+        out=""
+        while read -r name size rota type; do
+          if [ "$type" != "disk" ]; then continue; fi
+          gb=$(awk "BEGIN {printf \"%.2f\", $size/1024/1024/1024}")
+          if [ "$rota" = "0" ]; then kind="SSD"; else kind="HDD"; fi
+          out="$out $name:${kind}(${gb}GB)"
+          total=$(awk "BEGIN {printf \"%.2f\", $total + $gb}")
+        done < <(lsblk -b -d -o NAME,SIZE,ROTA,TYPE | tail -n +2)
+        echo "$total,$out"
+      register: disk_info
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: Save structured sysinfo fact
+      set_fact:
+        collected_sysinfo:
+          hostname: "{{ ansible_hostname }}"
+          cpu: "{{ cpu_model.stdout | default('N/A') }}"
+          ram_mb: "{{ ansible_memtotal_mb }}"
+          ram_slots: "{{ (ram_info.stdout.split(',')[0]) | default('N/A') }}"
+          ram_type: "{{ (ram_info.stdout.split(',')[1]) | default('Unknown') }}"
+          storage_gb: "{{ (disk_info.stdout.split(',')[0]) | default('0') }}"
+          drives: "{{ (disk_info.stdout.split(',', 2)[1]) | default('N/A') }}"
+
+    - name: Display concise system summary
+      debug:
+        msg: |
+          🖥️ Hostname: {{ collected_sysinfo.hostname }}
+          🧠 CPU: {{ collected_sysinfo.cpu }}
+          💾 RAM: {{ collected_sysinfo.ram_mb }} MB
+          🔢 Slots/Type: {{ collected_sysinfo.ram_slots }} ({{ collected_sysinfo.ram_type }})
+          📦 Storage: {{ collected_sysinfo.storage_gb }} GB
+          💽 Drives: {{ collected_sysinfo.drives }}
+
+
+# ==========================================================
+# MODULE 2 - Aggregate & Save Reports on Trusted Host
+# ==========================================================
+- name: Aggregate and save reports on trusted host (manual home path)
+  hosts: all
+  gather_facts: false
+  run_once: true
+  become: false
+
+  vars:
+    trusted_host: 192.168.2.129        # 🔧 <-- enter your trusted host IP here
+    remote_home: "/home/ansibleadmin"       # 🔧 <-- enter your home path here
+    timestamp: "{{ lookup('pipe','date +%Y-%m-%d_%H-%M-%S') }}"
+    report_dir: "{{ remote_home }}/hosts-info-ansible"
+    csv_file: "{{ report_dir }}/sysinfo_report_{{ timestamp }}.csv"
+    json_file: "{{ report_dir }}/sysinfo_report_{{ timestamp }}.json"
+
+  tasks:
+    - name: Ensure report directory exists
+      delegate_to: "{{ trusted_host }}"
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Build data list from collected facts (all hosts)
+      set_fact:
+        data_list: "{{ hostvars | dict2items | map(attribute='value.collected_sysinfo') | select('defined') | list }}"
+
+    - name: Write JSON report on trusted host
+      delegate_to: "{{ trusted_host }}"
+      copy:
+        dest: "{{ json_file }}"
+        content: "{{ data_list | to_nice_json }}"
+        mode: '0644'
+
+    - name: Write CSV report on trusted host
+      delegate_to: "{{ trusted_host }}"
+      copy:
+        dest: "{{ csv_file }}"
+        content: |
+          "Hostname","CPU","RAM_MB","RAM_Slots","RAM_Type","Storage_GB","Drives"
+          {% for i in data_list %}
+          "{{ i.hostname }}","{{ i.cpu }}","{{ i.ram_mb }}","{{ i.ram_slots | regex_replace('([0-9]+)/([0-9]+)', '\\1 of \\2') }}","{{ i.ram_type }}","{{ i.storage_gb }}","{{ i.drives }}"
+          {% endfor %}
+        mode: '0644'
+
+    - name: Final confirmation
+      delegate_to: "{{ trusted_host }}"
+      debug:
+        msg: |
+          ✅ Reports saved on trusted host (as SSH user):
+          CSV: {{ csv_file }}
+          JSON: {{ json_file }}

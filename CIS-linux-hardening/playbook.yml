@@ -1,0 +1,104 @@
+---
+- name: Check AppArmor Compliance (JSON Summary)
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    report_subdir: "Documents/ansible/CIS-linux-hardening"
+
+  tasks:
+    #####################################################################
+    # 1️⃣ Gather user environment info without privilege escalation
+    #####################################################################
+    - name: Get SSH user's home directory
+      become: false
+      command: bash -c "echo $HOME"
+      register: user_home
+      changed_when: false
+
+    - set_fact:
+        report_dir: "{{ user_home.stdout }}/{{ report_subdir }}"
+        report_file: "{{ user_home.stdout }}/{{ report_subdir }}/apparmor_status_{{ timestamp }}.json"
+
+    #####################################################################
+    # 2️⃣ Ensure AppArmor is installed
+    #####################################################################
+    - name: Check if AppArmor package is installed
+      command: dpkg -s apparmor
+      register: apparmor_pkg
+      ignore_errors: true
+      changed_when: false
+
+    - set_fact:
+        apparmor_installed: "{{ apparmor_pkg.rc == 0 }}"
+
+    #####################################################################
+    # 3️⃣ Ensure AppArmor is enabled in kernel
+    #####################################################################
+    - name: Check if AppArmor is enabled in the kernel
+      command: cat /sys/module/apparmor/parameters/enabled
+      register: apparmor_kernel
+      ignore_errors: true
+      changed_when: false
+
+    - set_fact:
+        apparmor_enabled: "{{ apparmor_kernel.stdout.strip() == 'Y' }}"
+
+    #####################################################################
+    # 4️⃣ Ensure AppArmor profiles are active
+    #####################################################################
+    - name: Check AppArmor status
+      command: aa-status
+      register: aa_status
+      ignore_errors: true
+      changed_when: false
+
+    - set_fact:
+        apparmor_profiles_ok: "{{ ('profiles are loaded' in aa_status.stdout) and ('profiles are disabled' not in aa_status.stdout) }}"
+        apparmor_all_enforcing: "{{ 'profiles are in enforce mode' in aa_status.stdout and 'profiles are in complain mode' not in aa_status.stdout }}"
+
+    #####################################################################
+    # 5️⃣ Prepare summary
+    #####################################################################
+    - set_fact:
+        apparmor_summary:
+          "Ensure AppArmor is installed": "{{ 'Yes' if apparmor_installed else 'No (Action Required)' }}"
+          "Ensure AppArmor is enabled in the bootloader configuration": "{{ 'Yes' if apparmor_enabled else 'No (Action Required)' }}"
+          "Ensure all AppArmor Profiles are in enforce or complain mode": "{{ 'Yes' if apparmor_profiles_ok else 'No (Action Required)' }}"
+          "Ensure all AppArmor Profiles are enforcing": "{{ 'Yes' if apparmor_all_enforcing else 'No (Action Required)' }}"
+
+    #####################################################################
+    # 6️⃣ Create report directory (as SSH user)
+    #####################################################################
+    - name: Create CIS report directory under user's Documents
+      become: false
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+
+    #####################################################################
+    # 7️⃣ Save report as JSON (as SSH user)
+    #####################################################################
+    - name: Save AppArmor report
+      become: false
+      copy:
+        dest: "{{ report_file }}"
+        content: "{{ apparmor_summary | to_nice_json }}"
+        mode: '0644'
+
+    #####################################################################
+    # 8️⃣ Print summary in console
+    #####################################################################
+    - name: Display AppArmor Summary
+      debug:
+        msg: |
+    
+          AppArmor Compliance Report
+
+          Ensure AppArmor is installed: {{ apparmor_summary['Ensure AppArmor is installed'] }}          Ensure AppArmor is enabled in the bootloader: {{ apparmor_summary['Ensure AppArmor is enabled in the bootloader configuration'] }}
+          Ensure all Profiles are in enforce/complain mode: {{ apparmor_summary['Ensure all AppArmor Profiles are in enforce or complain mode'] }}          Ensure all Profiles are enforcing: {{ apparmor_summary['Ensure all AppArmor Profiles are enforcing'] }}
+          ------------------------------------------------------------
+          Report saved to: {{ report_file }}

@@ -1,0 +1,126 @@
+---
+- name: Set and lock GNOME wallpaper system-wide (Enterprise-Safe, Final v2)
+  hosts: all
+  become: yes
+  become_user: root
+
+  vars:
+    wallpaper_source: "custom_wallpaper3.jpg"
+    wallpaper_dest: "/usr/share/backgrounds/custom_wallpaper.jpg"
+    picture_options: "zoom"
+
+    # Dconf paths
+    dconf_dir: "/etc/dconf/db/local.d"
+    dconf_file: "00-wallpaper"
+    dconf_lock_dir: "/etc/dconf/db/local.d/locks"
+    dconf_profile: "/etc/dconf/profile/user"
+
+  tasks:
+
+    # 1️⃣ Ensure required directories exist
+    - name: Ensure dconf directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ dconf_dir }}"
+        - "{{ dconf_lock_dir }}"
+
+    # 2️⃣ Copy wallpaper to system directory
+    - name: Copy wallpaper to system directory
+      ansible.builtin.copy:
+        src: "{{ wallpaper_source }}"
+        dest: "{{ wallpaper_dest }}"
+        owner: root
+        group: root
+        mode: '0644'
+        backup: yes
+      notify: Update dconf database
+
+    # 3️⃣ Configure GNOME system-wide wallpaper
+    - name: Create GNOME system-wide wallpaper config
+      ansible.builtin.copy:
+        dest: "{{ dconf_dir }}/{{ dconf_file }}"
+        content: |
+          [org/gnome/desktop/background]
+          picture-uri='file://{{ wallpaper_dest }}'
+          picture-uri-dark='file://{{ wallpaper_dest }}'
+          picture-options='{{ picture_options }}'
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Update dconf database
+
+    # 4️⃣ Lock wallpaper settings
+    - name: Create GNOME wallpaper lock file
+      ansible.builtin.copy:
+        dest: "{{ dconf_lock_dir }}/{{ dconf_file }}"
+        content: |
+          /org/gnome/desktop/background/picture-uri
+          /org/gnome/desktop/background/picture-uri-dark
+        owner: root
+        group: root
+        mode: '0444'
+      notify: Update dconf database
+
+    # 5️⃣ Ensure GNOME reads both user and system dconf databases
+    - name: Ensure /etc/dconf/profile/user is configured
+      ansible.builtin.copy:
+        dest: "{{ dconf_profile }}"
+        content: |
+          user-db:user
+          system-db:local
+        owner: root
+        group: root
+        mode: '0644'
+
+    # 6️⃣ Rebuild dconf database
+    - name: Rebuild dconf database
+      ansible.builtin.command:
+        cmd: dconf update
+      changed_when: false
+
+    # 7️⃣ Reset wallpaper for all local users
+    - name: Reset cached dconf user files
+      ansible.builtin.shell: |
+        for user in $(awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}'); do
+          HOME_DIR=$(getent passwd "$user" | cut -d: -f6)
+          if [ -d "$HOME_DIR/.config/dconf" ]; then
+            echo "Resetting dconf cache for $user"
+            rm -f "$HOME_DIR/.config/dconf/user"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    # 8️⃣ Apply wallpaper immediately for logged-in users (optional)
+    - name: Force wallpaper reload for all logged-in GNOME users
+      ansible.builtin.shell: |
+        for session in $(loginctl list-sessions --no-legend | awk '{print $1}'); do
+          user=$(loginctl show-session $session -p Name --value)
+          uid=$(id -u $user)
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus"
+          gsettings set org.gnome.desktop.background picture-uri 'file://{{ wallpaper_dest }}'
+          gsettings set org.gnome.desktop.background picture-uri-dark 'file://{{ wallpaper_dest }}'
+        done
+      ignore_errors: yes
+      changed_when: false
+
+    # 9️⃣ Display final status
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: |
+          ✅ Wallpaper applied system-wide: {{ wallpaper_dest }}
+          🧍 Affects all users (existing & new)
+          🔒 Locked from modification
+          🔄 Users will see it immediately or after relogin
+
+  handlers:
+    - name: Update dconf database
+      ansible.builtin.command:
+        cmd: dconf update
+      become: yes
+      become_user: root
+
